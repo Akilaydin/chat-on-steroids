@@ -55,6 +55,7 @@ const {
   attachSummary,
   beginContinuationDestinationSendNow,
   beginContinuationSourceSendNow,
+  bindContinuationProjectNow,
   bindContinuationDestinationMessageNow,
   claimContinuationNow,
   commitContinuation,
@@ -142,6 +143,19 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
 }
 
 describe('capturing the brief', () => {
+  it('keeps Project affinity across a restart before the replacement chat opens', async () => {
+    const summary = await createSession({ title: 'project work', conversationId: CHAT_A });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+    expect(await bindContinuationProjectNow(opened.token, 'g-p-68abcdef1234')).toBe(true);
+    expect(await attachSummary(opened.token, SAMPLE_BRIEF)).not.toBeNull();
+
+    const snapshot = snapshotContinuations();
+    resetContinuationsForTests();
+    await restoreContinuations(snapshot);
+
+    expect(continuationByToken(opened.token)?.project).toBe('g-p-68abcdef1234');
+  });
+
   it('answers a repeated capture with the handoff it already wrote', async () => {
     const summary = await createSession({ title: 'work', conversationId: CHAT_A });
     const opened = await openContinuationNow(summary.id, CHAT_A);

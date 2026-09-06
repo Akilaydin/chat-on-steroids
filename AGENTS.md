@@ -1221,6 +1221,10 @@ Conversation routing is not limited to `/c/<id>`. `chatgpt-dom.js::conversationF
 supported Project shape `/g/<project>/c/<id>` as the **same conversation id**. Every place that
 asks "which chat is this?" must use those shared route rules; teaching only the recorder about a
 Project URL while the service worker/recovery path still sees no conversation splits ownership.
+Compact & Resume also preserves that route as **creation affinity**: chat A's browser binds its
+Project segment into the durable continuation before the brief is published, and both browser
+placement and the OS/restart fallback open B through `/g/<project>/project`. Do not derive this only
+at final tab creation — that loses the Project as soon as fallback/recovery outlives chat A's page.
 
 **A turn opens from authored-user evidence, not from the Stop button.** A newly observed stable
 ChatGPT **user** message opens one local generation and emits `turn_start`. On reload the content

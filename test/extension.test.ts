@@ -1324,6 +1324,53 @@ describe('worker settings authority', () => {
     expect(worker.windowsUpdate).not.toHaveBeenCalled();
   });
 
+  it('keeps a Compact & Resume successor inside the source Project', async () => {
+    const project = 'g-p-68abcdef1234';
+    const compactBodies: Array<Record<string, unknown>> = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/compact' && init.method === 'POST') {
+        const body = JSON.parse(String(init.body || '{}')) as Record<string, unknown>;
+        compactBodies.push(body);
+        return response(200, {
+          stored: true,
+          commandId: 'cmd-project-handoff',
+          placement: { id: 'cmd-project-handoff', project: body.project }
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsGet: async () => ({
+        id: 47,
+        windowId: 9,
+        index: 2,
+        url: `https://chatgpt.com/g/${project}/c/${CHAT}`
+      }) as never
+    });
+    await worker.registerTab(47);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 47);
+
+    await worker.send(
+      { type: 'compact', conversationId: CHAT, token: '0123456789abcdef0123456789abcdef', summary: 'the brief' },
+      47
+    );
+
+    expect(compactBodies).toHaveLength(1);
+    expect(compactBodies[0]?.project).toBe(project);
+    expect(worker.tabsCreate).toHaveBeenCalledTimes(1);
+    const created = worker.tabsCreate.mock.calls[0]![0] as Record<string, unknown>;
+    expect(created.windowId).toBe(9);
+    expect(created.index).toBe(3);
+    expect(String(created.url)).toBe(
+      `https://chatgpt.com/g/${project}/project?clf=cmd-project-handoff#clf=cmd-project-handoff`
+    );
+  });
+
   it('leaves a compaction reply that places nothing to the app’s own opener', async () => {
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);

@@ -145,6 +145,7 @@ import {
   attachSummary,
   beginContinuationDestinationSendNow,
   beginContinuationSourceSendNow,
+  bindContinuationProjectNow,
   bindContinuationDestinationMessageNow,
   bindContinuationSourceMessageNow,
   claimContinuationNow,
@@ -161,6 +162,7 @@ import {
   repairPrimeFromResumeShadow,
   resetContinuationsForTests,
   sendUnattempted,
+  validProjectRouteSegment,
   type ContinuationSendState
 } from './session/continuation.js';
 import type { ContinuationView } from './session/continuation.js';
@@ -2376,6 +2378,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const token = typeof body['token'] === 'string' ? body['token'] : '';
       const entry = continuationByToken(token);
       if (!entry || entry.sessionId !== sessionId) return json(res, 409, { error: 'no_such_continuation' }, origin);
+      const projectPresent = Object.prototype.hasOwnProperty.call(body, 'project');
+      const project =
+        body['project'] === null
+          ? null
+          : validProjectRouteSegment(body['project'])
+            ? body['project']
+            : undefined;
       const brief = boundBrief(String(body['summary']));
       // Refused here rather than deeper, because this is where the reason can still be said
       // in words the page will put on screen. A brief that cannot be a brief is a failed
@@ -2424,6 +2433,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           },
           origin
         );
+      }
+      // Project affinity belongs to the continuation, not to the tab that happens to open B.
+      // Bind it before publishing the handoff so every later delivery path — browser placement,
+      // OS fallback, destination retry and restart recovery — derives the same creation target.
+      if (projectPresent) {
+        if (project === undefined) return json(res, 400, { error: 'bad_project' }, origin);
+        try {
+          const bound = await bindContinuationProjectNow(token, project);
+          if (!bound) return json(res, 409, { error: 'continuation_project_conflict' }, origin);
+        } catch (err) {
+          logWarn(
+            `bridge: could not durably bind Compact & Resume Project for ${sessionId} — ${err instanceof Error ? err.message : String(err)}`
+          );
+          return json(res, 503, { error: 'continuation_project_not_durable', retryable: true, sessionId }, origin);
+        }
       }
       const handoff = await attachSummary(token, brief);
       if (!handoff) {
@@ -4602,7 +4626,12 @@ export function chatUrl(conversationId: string): string {
 }
 
 /** Where the app opens a fresh worker/resume chat. The marker is an id, not a credential. */
-export function commandUrl(id: string, model?: string | null, reasoningEffort?: ReasoningEffort | null): string {
+export function commandUrl(
+  id: string,
+  model?: string | null,
+  reasoningEffort?: ReasoningEffort | null,
+  project?: string | null
+): string {
   // Both a query and a fragment: ChatGPT is a single-page app that rewrites its own URL
   // during boot, and which of the two survives has changed between builds. The content
   // script accepts either, and redeeming still requires the extension's bearer token —
@@ -4617,7 +4646,8 @@ export function commandUrl(id: string, model?: string | null, reasoningEffort?: 
   const params = [marker];
   if (model) params.push(`model=${encodeURIComponent(model)}`);
   if (reasoningEffort) params.push(`reasoning_effort=${encodeURIComponent(reasoningEffort)}`);
-  return `https://chatgpt.com/?${params.join('&')}#${marker}`;
+  const path = validProjectRouteSegment(project) ? `/g/${encodeURIComponent(project)}/project` : '/';
+  return `https://chatgpt.com${path}?${params.join('&')}#${marker}`;
 }
 
 /**
@@ -4704,7 +4734,13 @@ export const BROWSER_PLACEMENT_MS = 20_000;
 let placementCollector: string | null = null;
 
 /** The one fresh chat currently offered to its home page, and the fallback that outlives it. */
-let placementOffer: { id: string; conversationId: string | null; model: string | null; reasoningEffort: ReasoningEffort | null } | null = null;
+let placementOffer: {
+  id: string;
+  conversationId: string | null;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
+  project?: string;
+} | null = null;
 let placementTimer: NodeJS.Timeout | null = null;
 
 /** Drops the standing offer and its fallback. Called by every path that ends a command. */
@@ -4725,12 +4761,14 @@ function offerPlacement(command: Command): boolean {
   const home = commandHomeConversation(command.spec);
   const backgroundWorker = command.spec.type === 'worker' && getConfig().ui.backgroundChats && browserWakeConnected();
   if (!backgroundWorker && (!home || home !== placementCollector)) return false;
+  const project = command.spec.type === 'resume' ? continuationByToken(command.spec.token)?.project : undefined;
   clearPlacementOffer();
   placementOffer = {
     id: command.id,
     conversationId: backgroundWorker ? null : home,
     model: command.spec.type === 'worker' ? command.spec.model : null,
-    reasoningEffort: command.spec.type === 'worker' ? command.spec.reasoningEffort : null
+    reasoningEffort: command.spec.type === 'worker' ? command.spec.reasoningEffort : null,
+    ...(validProjectRouteSegment(project) ? { project } : {})
   };
   placementTimer = setTimeout(() => {
     placementTimer = null;
@@ -4756,7 +4794,13 @@ function offerPlacement(command: Command): boolean {
  * a second one. If that page fails to act, the fallback above is what recovers it, not a
  * repeated offer.
  */
-function pendingBrowserPlacement(conversationId: string | null): { id: string; model: string | null; reasoningEffort: ReasoningEffort | null; background?: true } | null {
+function pendingBrowserPlacement(conversationId: string | null): {
+  id: string;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
+  project?: string;
+  background?: true;
+} | null {
   const offer = placementOffer;
   if (!offer || offer.conversationId !== conversationId) return null;
   if (!commands.some((entry) => entry.id === offer.id && entry.owner === null)) {
@@ -4764,7 +4808,13 @@ function pendingBrowserPlacement(conversationId: string | null): { id: string; m
     return null;
   }
   placementOffer = null;
-  return { id: offer.id, model: offer.model, reasoningEffort: offer.reasoningEffort, ...(offer.conversationId === null ? { background: true as const } : {}) };
+  return {
+    id: offer.id,
+    model: offer.model,
+    reasoningEffort: offer.reasoningEffort,
+    ...(offer.project ? { project: offer.project } : {}),
+    ...(offer.conversationId === null ? { background: true as const } : {})
+  };
 }
 
 // -------------------------------------------------------- exact browser recovery
@@ -6661,10 +6711,11 @@ async function openFreshChatInBrowser(command: Command): Promise<void> {
     // Stamped whether or not a browser was already running: this process cannot tell the
     // difference, and the window it opens is only ever spent by a browser failing to appear.
     if (!browserPresent()) lastBrowserLaunchAt = Date.now();
+    const project = command.spec.type === 'resume' ? continuationByToken(command.spec.token)?.project : undefined;
     await openInBrowser(
       command.spec.type === 'worker'
         ? commandUrl(command.id, command.spec.model, command.spec.reasoningEffort)
-        : commandUrl(command.id)
+        : commandUrl(command.id, null, null, project)
     );
   } catch (err) {
     // One command is one browser-open attempt. A rejected opener can never produce an ACK,

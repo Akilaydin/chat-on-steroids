@@ -150,6 +150,15 @@ interface Continuation {
   sessionId: string;
   /** Chat A: where the session is attached until the commit lands. */
   from: string;
+  /**
+   * ChatGPT Project route affinity for chat B.
+   *
+   * `undefined` means an older/automatic ticket has not yet been bound by chat A's browser,
+   * `null` means A was positively observed at the site root, and a string is the Project route
+   * segment. The source page binds this before the handoff is published so every later open —
+   * including restart/fallback — derives from the continuation rather than transient tab state.
+   */
+  project: string | null | undefined;
   openedAt: number;
   /** Auto-compaction ticket: survives page/retry clocks until commit or explicit Off/cancel. */
   automatic: boolean;
@@ -188,10 +197,17 @@ const checkpointLocks = new Map<string, Promise<unknown>>();
 export const CONTINUATIONS_STATE = 'continuations';
 const RESUME_SHADOW_COLLISION = 'the replacement chat already belongs to another local session';
 
+/** One safe ChatGPT `/g/<project>/...` route segment, never a URL or path supplied by the page. */
+export function validProjectRouteSegment(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
 interface ContinuationRecord {
   token: string;
   sessionId: string;
   from: string;
+  /** Absent in records written before Project affinity was carried by the continuation. */
+  project?: string | null;
   to: string | null;
   openedAt: number;
   /** Absent in records written before durable auto-compaction tickets existed. */
@@ -221,6 +237,7 @@ function durableRecord(entry: Continuation): ContinuationRecord {
     token: entry.token,
     sessionId: entry.sessionId,
     from: entry.from,
+    project: entry.project,
     to: entry.to,
     openedAt: entry.openedAt,
     automatic: entry.automatic,
@@ -270,6 +287,7 @@ function publishRecord(entry: Continuation, record: ContinuationRecord): void {
   // waiting out a window that is already over.
   if (record.state === 'committed' || record.state === 'aborted') endResumeClaim(entry.token);
   entry.to = record.to;
+  entry.project = record.project;
   entry.automatic = record.automatic === true;
   entry.state = record.state;
   entry.summary = record.summary;
@@ -336,6 +354,7 @@ export interface ContinuationView {
   token: string;
   sessionId: string;
   from: string;
+  project: string | null | undefined;
   to: string | null;
   state: ContinuationState;
   handoffId: string | null;
@@ -352,6 +371,7 @@ const view = (entry: Continuation): ContinuationView => ({
   token: entry.token,
   sessionId: entry.sessionId,
   from: entry.from,
+  project: entry.project,
   to: entry.to,
   state: entry.state,
   handoffId: entry.handoffId,
@@ -627,6 +647,7 @@ function makeContinuation(sessionId: string, fromConversationId: string, automat
     token: randomBytes(16).toString('base64url'),
     sessionId,
     from: fromConversationId,
+    project: undefined,
     openedAt: Date.now(),
     automatic,
     askedAt: null,
@@ -690,6 +711,23 @@ async function withCheckpointLock<T>(token: string, work: () => Promise<T>): Pro
   } finally {
     if (checkpointLocks.get(token) === current) checkpointLocks.delete(token);
   }
+}
+
+/**
+ * Binds the browser-observed source route before the handoff is published.
+ *
+ * Automatic tickets can be filed by the app before a page is involved, so the Project cannot be
+ * known at {@link openContinuationNow}. The source page supplies it when it captures the brief;
+ * once bound, a retry or stale document may confirm the same value but may never redirect B.
+ */
+export async function bindContinuationProjectNow(token: string, project: string | null): Promise<boolean> {
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || !isOpen(entry)) return false;
+    if (entry.project !== undefined) return entry.project === project;
+    await transitionNow(entry, (current) => ({ ...current, project }));
+    return true;
+  });
 }
 
 /**
@@ -1376,6 +1414,7 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       token: raw.token,
       sessionId: raw.sessionId,
       from: raw.from,
+      project: raw.project === null ? null : validProjectRouteSegment(raw.project) ? raw.project : undefined,
       to: typeof raw.to === 'string' && raw.to ? raw.to : null,
       openedAt: raw.openedAt,
       automatic: raw.automatic === true,

@@ -2236,6 +2236,28 @@ function conversationFromUrl(value) {
   }
 }
 
+/**
+ * The Project route of one concrete conversation, when the current tab URL proves it.
+ *
+ * `known:true, project:null` is intentionally different from unknown: it proves the source is
+ * a root chat. Project ids are carried as one allowlisted route segment, never as a page-supplied
+ * URL, so the app can durably recreate the same New Chat target after a restart or OS fallback.
+ */
+function projectFromConversationUrl(value, conversationId) {
+  try {
+    const url = new URL(String(value || ''));
+    const current = conversationFromUrl(url.href);
+    if (!current || current.toLowerCase() !== String(conversationId || '').toLowerCase()) {
+      return { known: false, project: null };
+    }
+    if (!url.pathname.startsWith('/g/')) return { known: true, project: null };
+    const match = /^\/g\/([A-Za-z0-9_-]{1,128})\/c\/[0-9a-f-]{8,64}(?:\/|$)/i.exec(url.pathname);
+    return match ? { known: true, project: match[1] } : { known: false, project: null };
+  } catch {
+    return { known: false, project: null };
+  }
+}
+
 function isChatGptUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -2631,6 +2653,16 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     await noteTabConversation(source, message.conversationId);
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    let projectBinding = { known: false, project: null };
+    if (typeof message.token === 'string' && typeof message.summary === 'string') {
+      try {
+        const tab = await chrome.tabs.get(source.tab);
+        if (ownsDocument(source)) projectBinding = projectFromConversationUrl(tab?.url, message.conversationId);
+      } catch {
+        // Older/reloading Chrome can briefly make tab metadata unavailable. Omitting the field
+        // keeps compatibility with the pre-affinity protocol; the app never guesses a Project.
+      }
+    }
     const result = await call('/compact', {
       method: 'POST',
       body: JSON.stringify({
@@ -2645,7 +2677,11 @@ const HANDLERS = {
         // open continuation for this chat, which is what keeps some other tab's text from
         // ever becoming this session's handoff.
         ...(typeof message.token === 'string' && typeof message.summary === 'string'
-          ? { token: message.token, summary: message.summary }
+          ? {
+              token: message.token,
+              summary: message.summary,
+              ...(projectBinding.known ? { project: projectBinding.project } : {})
+            }
           : {}),
         ...(typeof message.token === 'string' && message.sourceAttempt === true
           ? { token: message.token, sourceAttempt: true }
@@ -3152,6 +3188,7 @@ function deferredRevivalUrl(entry) {
  */
 async function placeSuccessorChat(raw, tabId) {
   const id = commandMarkerId(raw && raw.id);
+  const project = typeof raw?.project === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(raw.project) ? raw.project : null;
   if (id && raw.background === true) {
     const marker = `clf=${encodeURIComponent(id)}`;
     const model = commandModelSlug(raw.model);
@@ -3159,7 +3196,8 @@ async function placeSuccessorChat(raw, tabId) {
     const query = [marker];
     if (model) query.push(`model=${encodeURIComponent(model)}`);
     if (effort) query.push(`reasoning_effort=${encodeURIComponent(effort)}`);
-    const created = await createChatTab(`https://chatgpt.com/?${query.join('&')}#${marker}`, true);
+    const path = project ? `/g/${encodeURIComponent(project)}/project` : '/';
+    const created = await createChatTab(`https://chatgpt.com${path}?${query.join('&')}#${marker}`, true);
     if (Number.isInteger(created?.id)) {
       await chrome.tabs.update(created.id, { autoDiscardable: false });
       discardProtectedTabs[String(created.id)] = true;
@@ -3185,7 +3223,8 @@ async function placeSuccessorChat(raw, tabId) {
   const query = [marker];
   if (model) query.push(`model=${encodeURIComponent(model)}`);
   if (reasoningEffort) query.push(`reasoning_effort=${encodeURIComponent(reasoningEffort)}`);
-  const create = { url: `https://chatgpt.com/?${query.join('&')}#${marker}`, windowId: home.windowId, active: true };
+  const path = project ? `/g/${encodeURIComponent(project)}/project` : '/';
+  const create = { url: `https://chatgpt.com${path}?${query.join('&')}#${marker}`, windowId: home.windowId, active: true };
   // Directly after the chat it continues, so a handoff reads as one piece of work instead of a
   // tab appended to the far end of a long strip.
   if (typeof home.index === 'number') create.index = home.index + 1;

@@ -3914,7 +3914,7 @@ describe('which browser opens the replacement chat', () => {
   const HOME = 'c0c0c0c0-1111-4222-8333-000000000b01';
 
   /** The real capture path: A's page files the ticket and then hands over its brief. */
-  async function captureFrom(conversationId: string): Promise<Reply> {
+  async function captureFrom(conversationId: string, project?: string | null): Promise<Reply> {
     await request('POST', '/events', {
       body: {
         conversationId,
@@ -3929,7 +3929,7 @@ describe('which browser opens the replacement chat', () => {
     return request('POST', '/compact', {
       body: { conversationId, token, summary: `carry on
 
-${SAMPLE_BRIEF}` }
+${SAMPLE_BRIEF}`, ...(project !== undefined ? { project } : {}) }
     });
   }
 
@@ -3986,6 +3986,28 @@ ${SAMPLE_BRIEF}` }
       // the old way well inside its own ninety-second deadline rather than expiring unopened.
       await vi.advanceTimersByTimeAsync(BROWSER_PLACEMENT_MS + 1);
       expect(opened).toEqual([commandUrl(stored.body.commandId as string)]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the source Project on both browser placement and OS fallback', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const project = 'g-p-68abcdef1234';
+      const stored = await captureFrom(HOME, project);
+
+      expect(stored.body.placement).toEqual({
+        id: stored.body.commandId,
+        model: null,
+        reasoningEffort: null,
+        project
+      });
+      expect(opened).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(BROWSER_PLACEMENT_MS + 1);
+      expect(opened).toEqual([commandUrl(stored.body.commandId as string, null, null, project)]);
     } finally {
       vi.useRealTimers();
     }
